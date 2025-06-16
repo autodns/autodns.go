@@ -1,4 +1,4 @@
-// Copyright 2025 Jelly Terra <jellyterra@symboltics.com>
+// Copyright 2025 Jelly Terra <jellyterra@proton.me>
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0
 // that can be found in the LICENSE file and https://mozilla.org/MPL/2.0/.
 
@@ -6,20 +6,24 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/autodns/autodns.go/core"
 	"io"
 	"net/http"
+	"os"
 	"path"
+	"time"
+
+	"github.com/autodns/autodns.go/core"
 )
 
 func HandleWrap(handler func(w http.ResponseWriter, r *http.Request) (int, error, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		code, err, i_err := handler(w, r)
+		code, err, iErr := handler(w, r)
 		switch {
-		case i_err != nil:
+		case iErr != nil:
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Println(i_err)
+			fmt.Println(iErr)
 		case err != nil:
 			if code != 0 {
 				w.WriteHeader(code)
@@ -44,7 +48,7 @@ type ReqDo struct {
 	Operations []*core.Operation `json:"operations"`
 }
 
-func Serve(ctx context.Context, globalCache *core.GlobalCache, addr string, route string, db *core.Database) error {
+func Serve(ctx context.Context, c *core.Context, addr string, route string) error {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(path.Join(route, "/v1/do"), HandleWrap(func(w http.ResponseWriter, r *http.Request) (int, error, error) {
@@ -54,44 +58,40 @@ func Serve(ctx context.Context, globalCache *core.GlobalCache, addr string, rout
 		}
 
 		req, err := UnmarshalJSON(b, &ReqDo{})
-
-		ok, err := db.MatchRoleToken(r.Context(), req.Role, req.Token)
-		if err != nil {
-			return 0, nil, err
-		}
-		if !ok {
-			return http.StatusUnauthorized, fmt.Errorf("invalid token"), nil
-		}
-
-		err, i_err := core.ValidateAll(ctx, globalCache, db, req.Role, req.Operations)
-		if i_err != nil {
-			return 0, nil, i_err
-		}
 		if err != nil {
 			return 0, err, nil
 		}
 
-		go func() {
-			registries, err := core.BuildRegistries(ctx, db, req.Operations)
-			if err != nil {
-				fmt.Println("Building registries failed:", err)
-				return
-			}
+		roleDef, err := core.Query(c, &core.RoleDef{}, "role", req.Role)
+		switch {
+		case err == nil:
+		case os.IsNotExist(err):
+			return http.StatusUnauthorized, fmt.Errorf("authorization failed"), nil
+		default:
+			return 0, nil, err
+		}
 
-			core.ExecuteAll(req.Operations, registries, func(err error, op *core.Operation) {
-				switch op.Op {
-				case core.OP_UPDATE:
-					fmt.Printf("Role [%s] updates [%s] => [%s] with TTL [%d]", op.Role, op.CanonicalName, op.Value, op.TTL)
-				case core.OP_DELETE:
-					fmt.Printf("Role [%s] deletes [%s]", op.Role, op.CanonicalName)
-				}
-				if err != nil {
-					fmt.Println(", failed:", err)
-				} else {
-					fmt.Print("\n")
-				}
-			})
-		}()
+		key, ok := roleDef.Keys[req.Token]
+		if !ok || key.Expire != 0 && key.Expire < time.Now().Unix() {
+			return http.StatusUnauthorized, fmt.Errorf("authorization failed"), nil
+		}
+
+		err = core.ExecuteAll(c, roleDef, req.Operations, func(err error, op *core.Operation) {
+			switch op.Op {
+			case core.OP_UPDATE:
+				fmt.Printf("Role [%s] updates [%s] => [%s] with TTL [%d]", req.Role, op.CanonicalName, op.Value, op.TTL)
+			case core.OP_DELETE:
+				fmt.Printf("Role [%s] deletes [%s]", req.Role, op.CanonicalName)
+			}
+			if err != nil {
+				fmt.Println(", failed:", err)
+			} else {
+				fmt.Print("\n")
+			}
+		})
+		if err != nil {
+			return 0, nil, err
+		}
 
 		return 0, nil, nil
 	}))
@@ -104,5 +104,9 @@ func Serve(ctx context.Context, globalCache *core.GlobalCache, addr string, rout
 		_ = s.Shutdown(ctx)
 	}()
 
-	return s.ListenAndServe()
+	err := s.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }

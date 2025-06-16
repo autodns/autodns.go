@@ -1,44 +1,20 @@
-// Copyright 2025 Jelly Terra <jellyterra@symboltics.com>
+// Copyright 2025 Jelly Terra <jellyterra@proton.me>
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0
 // that can be found in the LICENSE file and https://mozilla.org/MPL/2.0/.
 
 package core
 
 import (
-	"context"
 	"fmt"
-	"golang.org/x/net/idna"
-	"regexp"
 	"sync"
+
+	"golang.org/x/net/idna"
 )
 
 const (
 	OP_UPDATE = "update"
 	OP_DELETE = "delete"
 )
-
-type GlobalCache struct {
-	Glob     map[string]*regexp.Regexp
-	GlobLock sync.RWMutex
-}
-
-func NewGlobalCache() *GlobalCache {
-	return &GlobalCache{
-		Glob: make(map[string]*regexp.Regexp, 8),
-	}
-}
-
-func (c *GlobalCache) SetGlob(globExpr string, glob *regexp.Regexp) {
-	c.GlobLock.Lock()
-	c.Glob[globExpr] = glob
-	c.GlobLock.Unlock()
-}
-
-func (c *GlobalCache) GetGlob(glob string) *regexp.Regexp {
-	c.GlobLock.RLock()
-	defer c.GlobLock.RUnlock()
-	return c.Glob[glob]
-}
 
 type Operation struct {
 	Record
@@ -47,118 +23,69 @@ type Operation struct {
 	Subdomain string `json:"subdomain"`
 
 	Registry string
-	Role     string
 }
 
-func MatchGlob(str, glob string, cache *GlobalCache) (_ bool, err error) {
-	switch {
-	case glob == "":
-		return str == "", nil
-	case glob == "*":
-		return true, nil
-	case glob == ".*":
-		return true, nil
+func ValidateOperation(roleDef *RoleDef, op *Operation) error {
+	result, err := Validate(roleDef, op.Domain, op.Subdomain)
+	if err != nil {
+		return err
 	}
 
-	compiled := cache.GetGlob(glob)
-	if compiled == nil {
-		compiled, err = regexp.Compile(glob)
+	op.Registry = result.Registry
+
+	op.Domain, err = idna.ToASCII(op.Domain)
+	if err != nil {
+		return err
+	}
+
+	if op.Subdomain == "" {
+		op.CanonicalName = op.Domain
+	} else {
+		op.Subdomain, err = idna.ToASCII(op.Subdomain)
 		if err != nil {
-			return false, err
+			return err
 		}
-		cache.SetGlob(glob, compiled)
+
+		op.CanonicalName = op.Domain + "." + op.Subdomain
 	}
 
-	return compiled.MatchString(str), nil
+	return nil
 }
 
-func ValidateAll(ctx context.Context, cache *GlobalCache, db *Database, role string, operations []*Operation) (error, error) {
+func ExecuteAll(c *Context, roleDef *RoleDef, operations []*Operation, callback func(err error, op *Operation)) error {
+
+	// Authorize and check.
+
 	for _, op := range operations {
-		subdomainGlob, ok, err := db.QueryRoleSubdomainGlob(ctx, role, op.Domain)
+		err := ValidateOperation(roleDef, op)
 		if err != nil {
-			return err, nil
+			return err
 		}
-		if !ok {
-			return fmt.Errorf("permission denied: %s is not under control of the role %s", op.Domain, role), nil
-		}
-
-		op.Domain, err = idna.ToASCII(op.Domain)
-		if err != nil {
-			return err, nil
-		}
-
-		if op.Subdomain == "" {
-			op.CanonicalName = op.Domain
-		} else {
-			op.Subdomain, err = idna.ToASCII(op.Subdomain)
-			if err != nil {
-				return err, nil
-			}
-
-			ok, err := MatchGlob(op.Subdomain, subdomainGlob, cache)
-			if err != nil {
-				return err, nil
-			}
-			if !ok {
-				return fmt.Errorf("operation not permitted: %s breaks the glob pattern for role %s: `%s`", op.Subdomain, role, subdomainGlob), nil
-			}
-
-			op.CanonicalName = op.Subdomain + "." + op.Domain
-		}
-
-		op.Role = role
 	}
 
-	return nil, nil
-}
+	// Build registries.
 
-func BuildRegistries(ctx context.Context, db *Database, operations []*Operation) (map[string]Registry, error) {
 	registries := make(map[string]Registry)
 
 	for _, op := range operations {
-		if registries[op.Registry] != nil {
-			continue
-		}
-
-		registryName, ok, err := db.QueryDomainRegistry(ctx, op.Domain)
+		registryDef, err := Query(c, &RegistryDef{}, "registry", op.Registry)
 		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, fmt.Errorf("no corresponding registry for domain %s", op.Domain)
+			return err
 		}
 
-		conf, err := db.QueryRegistryConfig(ctx, registryName)
-		switch {
-		case err != nil:
-			return nil, err
-		case conf == nil:
-			return nil, fmt.Errorf("missing config for registry %s", registryName)
+		builder := RegistryBuilders[registryDef.Builder]
+		if builder == nil {
+			return fmt.Errorf("registry [%s] builder [%s] is not builtin", op.Registry, registryDef.Builder)
 		}
 
-		builderName, ok := conf["builder"]
-		if !ok {
-			return nil, fmt.Errorf("undefined registry builder for %s: key `builder` should be specified", op.Domain)
-		}
-
-		registryBuilder, ok := RegistryBuilders[builderName]
-		if !ok {
-			return nil, fmt.Errorf("no registry builder called %s found for %s", builderName, op.Domain)
-		}
-
-		registry, err := registryBuilder(conf)
+		registries[op.Registry], err = builder(registryDef.BuilderParams)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("registry [%s] builder [%s] failed: %v", op.Registry, registryDef.Builder, err)
 		}
-
-		registries[registryName] = registry
-		op.Registry = registryName
 	}
 
-	return registries, nil
-}
+	// Execute operations.
 
-func ExecuteAll(operations []*Operation, registries map[string]Registry, callback func(err error, op *Operation)) {
 	deleted := map[string][]*Operation{}
 	updated := map[string][]*Operation{}
 
@@ -171,15 +98,17 @@ func ExecuteAll(operations []*Operation, registries map[string]Registry, callbac
 		}
 	}
 
-	haveDone := map[string]bool{}
+	hasBeenDeleted := map[string]bool{}
 
 	var wg sync.WaitGroup
 	for registryName, operations := range updated {
 		for _, op := range operations {
-			if haveDone[op.Domain] {
+
+			// Delete all records with same domain name.
+			if hasBeenDeleted[op.CanonicalName] {
 				continue
 			}
-			haveDone[op.Domain] = true
+			hasBeenDeleted[op.CanonicalName] = true
 
 			wg.Add(1)
 			go func() {
@@ -210,4 +139,6 @@ func ExecuteAll(operations []*Operation, registries map[string]Registry, callbac
 			}()
 		}
 	}
+
+	return nil
 }

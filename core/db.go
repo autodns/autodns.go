@@ -1,95 +1,174 @@
-// Copyright 2025 Jelly Terra <jellyterra@symboltics.com>
+// Copyright 2025 Jelly Terra <jellyterra@proton.me>
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0
 // that can be found in the LICENSE file and https://mozilla.org/MPL/2.0/.
 
 package core
 
 import (
-	"context"
-	redis "github.com/redis/rueidis"
-	"maps"
+	"encoding/json"
+	"errors"
+	"os"
+	"path"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
-type Database struct {
-	redis.Client
+type RegistryDef struct {
+	Builder       string            `json:"builder"`
+	BuilderParams map[string]string `json:"builder_params"`
 }
 
-const (
-	PREFIX_ROLE_TOKEN          = "RoleToken:"
-	PREFIX_ROLE_SUBDOMAIN_GLOB = "RoleSubdomainGlob:"
-	PREFIX_REGISTRY            = "Registry:"
+type ManagedDomainDef struct {
+	Registry string `json:"registry"`
 
-	KEY_DOMAIN_REGISTRY = "DomainRegistry"
-)
-
-func (db *Database) UpdateRoleToken(ctx context.Context, role, token, desc string) error {
-	return db.Do(ctx, db.B().Hset().Key(PREFIX_ROLE_TOKEN+role).FieldValue().FieldValue(token, desc).Build()).Error()
+	Glob string `json:"glob"`
 }
 
-func (db *Database) MatchRoleToken(ctx context.Context, role, token string) (bool, error) {
-	return db.Do(ctx, db.B().Hexists().Key(PREFIX_ROLE_TOKEN+role).Field(token).Build()).AsBool()
+type AuthKeyDef struct {
+	Expire int64 `json:"expiration_time"`
 }
 
-func (db *Database) DeleteRoleToken(ctx context.Context, role, token string) error {
-	return db.Do(ctx, db.B().Hdel().Key(PREFIX_ROLE_TOKEN+role).Field(token).Build()).Error()
+type RoleDef struct {
+	Keys           map[string]AuthKeyDef       `json:"keys"`
+	ManagedDomains map[string]ManagedDomainDef `json:"managed_domains"`
 }
 
-func (db *Database) UpdateRoleSubdomainGlob(ctx context.Context, role, domain, glob string) error {
-	return db.Do(ctx, db.B().Hset().Key(PREFIX_ROLE_SUBDOMAIN_GLOB+role).FieldValue().FieldValue(domain, glob).Build()).Error()
+type ContextCache struct {
+	Time     int64
+	Val      any
+	lastUsed atomic.Int64
 }
 
-func (db *Database) QueryRoleSubdomainGlob(ctx context.Context, role, domain string) (string, bool, error) {
-	v, err := db.Do(ctx, db.B().Hget().Key(PREFIX_ROLE_SUBDOMAIN_GLOB+role).Field(domain).Build()).ToString()
-	switch {
-	case err == nil:
-		return v, true, nil
-	case redis.IsRedisNil(err):
-		return "", false, nil
-	default:
-		return "", false, err
+type Context struct {
+	BaseDir string
+
+	CacheLifetime int64
+	lastCheck     atomic.Int64
+
+	Cache     map[string]*ContextCache
+	cacheLock sync.RWMutex
+}
+
+func (c *Context) purgeCache() {
+	now := time.Now().Unix()
+	if now < c.lastCheck.Load()+c.CacheLifetime {
+		return
+	}
+
+	c.cacheLock.Lock()
+	defer c.cacheLock.Unlock()
+
+	// Check twice. The other thread might have gotten the lock and finished the job.
+	if now < c.lastCheck.Load()+c.CacheLifetime {
+		return
+	}
+	c.lastCheck.Store(now)
+
+	for k, v := range c.Cache {
+		if now > v.lastUsed.Load()+c.CacheLifetime {
+			// Expired.
+			delete(c.Cache, k)
+			continue
+		}
+
+		_, err := os.Stat(k)
+		if err != nil {
+			// Deleted.
+			delete(c.Cache, k)
+		}
 	}
 }
 
-func (db *Database) DeleteRoleSubdomainGlob(ctx context.Context, role, domain string) error {
-	return db.Do(ctx, db.B().Hdel().Key(PREFIX_ROLE_SUBDOMAIN_GLOB+role).Field(domain).Build()).Error()
-}
+func Query[T any](c *Context, v *T, keys ...string) (*T, error) {
+	c.purgeCache()
 
-func (db *Database) DeleteRole(ctx context.Context, role string) error {
-	err := db.Do(ctx, db.B().Del().Key(PREFIX_ROLE_TOKEN+role).Build()).Error()
+	fName := path.Join(keys...) + ".json"
+	if strings.Contains(fName, "..") {
+		return nil, errors.New("invalid fName")
+	}
+
+	fStat, err := os.Stat(fName)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return db.Do(ctx, db.B().Del().Key(PREFIX_ROLE_SUBDOMAIN_GLOB).Build()).Error()
+
+	cacheMiss := func() (*T, error) {
+		b, err := os.ReadFile(fName)
+		if err != nil {
+			return nil, err
+		}
+
+		err = json.Unmarshal(b, v)
+		if err != nil {
+			return nil, err
+		}
+
+		// Write to cache.
+		c.cacheLock.Lock()
+		cache := &ContextCache{Time: fStat.ModTime().Unix(), Val: v}
+		cache.lastUsed.Store(time.Now().Unix())
+		c.Cache[fName] = cache
+		c.cacheLock.Unlock()
+
+		return v, nil
+	}
+
+	c.cacheLock.RLock()
+	cache, exist := c.Cache[fName]
+	c.cacheLock.RUnlock()
+	if exist {
+		// Cache miss.
+		if fStat.ModTime().Unix() != cache.Time {
+			// Disk change.
+			v, err = cacheMiss()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// Cache hit.
+			cache.lastUsed.Store(time.Now().Unix())
+			v = cache.Val.(*T)
+		}
+	} else {
+		v, err = cacheMiss()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return v, err
 }
 
-func (db *Database) UpdateDomainRegistry(ctx context.Context, domain, registry string) error {
-	return db.Do(ctx, db.B().Hset().Key(KEY_DOMAIN_REGISTRY).FieldValue().FieldValue(domain, registry).Build()).Error()
+type ValidationResult struct {
+	Registry string
 }
 
-func (db *Database) QueryDomainRegistry(ctx context.Context, domain string) (string, bool, error) {
-	v, err := db.Do(ctx, db.B().Hget().Key(KEY_DOMAIN_REGISTRY).Field(domain).Build()).ToString()
-	switch {
-	case err == nil:
-		return v, true, nil
-	case redis.IsRedisNil(err):
-		return "", false, nil
+func Validate(roleDef *RoleDef, domain string, subdomain string) (*ValidationResult, error) {
+	d, exist := roleDef.ManagedDomains[domain]
+	if !exist {
+		return nil, errors.New("permission denied")
+	}
+
+	switch d.Glob {
+	case "":
+		if subdomain != "" {
+			return nil, errors.New("permission denied")
+		}
+	case "*":
 	default:
-		return "", false, err
+		matched, err := regexp.MatchString(d.Glob, subdomain)
+		if err != nil {
+			return nil, err
+		}
+		if !matched {
+			return nil, errors.New("permission denied")
+		}
 	}
-}
 
-func (db *Database) DeleteDomainRegistry(ctx context.Context, domain string) error {
-	return db.Do(ctx, db.B().Hdel().Key(KEY_DOMAIN_REGISTRY).Field(domain).Build()).Error()
-}
-
-func (db *Database) UpdateRegistryConfig(ctx context.Context, registry string, config map[string]string) error {
-	return db.Do(ctx, db.B().Hset().Key(PREFIX_REGISTRY+registry).FieldValue().FieldValueIter(maps.All(config)).Build()).Error()
-}
-
-func (db *Database) QueryRegistryConfig(ctx context.Context, registry string) (map[string]string, error) {
-	return db.Do(ctx, db.B().Hgetall().Key(PREFIX_REGISTRY+registry).Build()).AsStrMap()
-}
-
-func (db *Database) DeleteRegistry(ctx context.Context, registry string) error {
-	return db.Do(ctx, db.B().Del().Key(PREFIX_REGISTRY+registry).Build()).Error()
+	return &ValidationResult{
+		Registry: d.Registry,
+	}, nil
 }

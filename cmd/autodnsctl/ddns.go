@@ -1,4 +1,4 @@
-// Copyright 2025 Jelly Terra <jellyterra@symboltics.com>
+// Copyright 2025 Jelly Terra <jellyterra@proton.me>
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0
 // that can be found in the LICENSE file and https://mozilla.org/MPL/2.0/.
 
@@ -6,11 +6,9 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"github.com/autodns/autodns.go/core"
 	"io"
-	"log"
 	"maps"
 	"net"
 	"net/http"
@@ -45,7 +43,7 @@ type Record struct {
 type Zone struct {
 	Server  string   `json:"server"`
 	Role    string   `json:"role"`
-	Token   string   `json:"token"`
+	Key     string   `json:"key"`
 	Records []Record `json:"records"`
 }
 
@@ -54,175 +52,140 @@ type DDNSConfig struct {
 	Zones    []Zone    `json:"zones"`
 }
 
-func _ddns() error {
-	triggerC := make(chan struct{}, 1)
+func DDNS(configPath string) func() error {
+	var (
+		lastModTime   = time.Now().Unix()
+		config        *DDNSConfig
+		addrSetsCache map[string]map[string]bool
+	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		err := TriggerNotify(ctx, triggerC)
-		if err != nil {
-			log.Fatalln("notification trigger setup failed:", err)
-		}
-	}()
-
-	triggerC <- struct{}{}
-
-	for {
-		select {
-		case <-triggerC:
-			delay := time.After(1 * time.Second)
-			func() {
-				for {
-					select {
-					case <-delay:
-						return
-					case <-triggerC:
-					}
-				}
-			}()
-
-			err := triggerDDNS()
-			if err != nil {
-				return err
-			}
-		case <-signalC:
-			return nil
+	// Drop config cache and start from none.
+	initAddrSetsCache := func() {
+		addrSetsCache = map[string]map[string]bool{}
+		for _, addrSet := range config.AddrSets {
+			addrSetsCache[addrSet.Name] = map[string]bool{}
 		}
 	}
-}
 
-var (
-	lastModTime   = time.Now().Unix()
-	config        *DDNSConfig
-	addrSetsCache map[string]map[string]bool
-)
-
-func initAddrSetsCache() {
-	addrSetsCache = map[string]map[string]bool{}
-	for _, addrSet := range config.AddrSets {
-		addrSetsCache[addrSet.Name] = map[string]bool{}
-	}
-}
-
-func triggerDDNS() error {
-	stat, err := os.Stat(*ddnsConfig)
-	if err != nil {
-		return err
-	}
-
-	if stat.ModTime().Unix() != lastModTime {
-		fmt.Println("Load configuration")
-		config, err = LoadDDNSConfig(*ddnsConfig)
-		if err != nil {
-			return fmt.Errorf("loading config in JSON failed: %v", err)
-		}
-
-		lastModTime = stat.ModTime().Unix()
-
-		initAddrSetsCache()
-	}
-
-	addrSetMap := map[string][]net.IP{}
-
-	same := true
-	for _, addrSet := range config.AddrSets {
-		addrs, err := CollectAddrSet(addrSet)
+	// Update records.
+	return func() error {
+		stat, err := os.Stat(configPath)
 		if err != nil {
 			return err
 		}
-		addrSetMap[addrSet.Name] = addrs
 
-		for _, addr := range addrs {
-			same = addrSetsCache[addrSet.Name][addr.String()] && same
-		}
-	}
-	if same {
-		return nil
-	}
-
-	initAddrSetsCache()
-	for addrSetName, addrSet := range addrSetMap {
-		for _, addr := range addrSet {
-			addrSetsCache[addrSetName][addr.String()] = true
-		}
-	}
-
-	for _, zone := range config.Zones {
-		var operations []*core.Operation
-
-		for _, record := range zone.Records {
-			addrMap := map[string]net.IP{}
-
-			for _, addrSetName := range record.AddrSets {
-				for _, addr := range addrSetMap[addrSetName] {
-					addrMap[addr.String()] = addr
-				}
-			}
-
-			for _, addr := range slices.Collect(maps.Values(addrMap)) {
-				var typ string
-
-				switch {
-				case addr.To4() != nil:
-					typ = "A"
-				case addr.To16() != nil:
-					typ = "AAAA"
-				default:
-					continue
-				}
-
-				op := &core.Operation{
-					Record: core.Record{
-						Type:  typ,
-						Value: addr.String(),
-						TTL:   record.TTL,
-					},
-					Op:        "update",
-					Domain:    record.Domain,
-					Subdomain: record.Subdomain,
-				}
-				if op.Subdomain == "" {
-					op.CanonicalName = op.Domain
-				} else {
-					op.CanonicalName = op.Subdomain + "." + op.Domain
-				}
-				operations = append(operations, op)
-			}
-		}
-
-		go func() {
-			u, err := url.JoinPath(zone.Server, "/v1/do")
+		if stat.ModTime().Unix() != lastModTime {
+			fmt.Println("Load configuration")
+			config, err = LoadDDNSConfig(configPath)
 			if err != nil {
-				fmt.Println(err)
-				return
+				return fmt.Errorf("loading config in JSON failed: %v", err)
 			}
 
-			resp, err := http.Post(u, "application/json", bytes.NewReader(MarshalJSON(&ReqDo{
-				Role:       zone.Role,
-				Token:      zone.Token,
-				Operations: operations,
-			})))
+			lastModTime = stat.ModTime().Unix()
+
+			initAddrSetsCache()
+		}
+
+		addrSetMap := map[string][]net.IP{}
+
+		same := true
+		for _, addrSet := range config.AddrSets {
+			addrs, err := CollectAddrSet(addrSet)
 			if err != nil {
-				fmt.Println(err)
+				return err
 			}
-			if resp.StatusCode != http.StatusOK {
-				b, err := io.ReadAll(resp.Body)
+			addrSetMap[addrSet.Name] = addrs
+
+			for _, addr := range addrs {
+				same = addrSetsCache[addrSet.Name][addr.String()] && same
+			}
+		}
+		if same {
+			return nil
+		}
+
+		initAddrSetsCache()
+		for addrSetName, addrSet := range addrSetMap {
+			for _, addr := range addrSet {
+				addrSetsCache[addrSetName][addr.String()] = true
+			}
+		}
+
+		for _, zone := range config.Zones {
+			var operations []*core.Operation
+
+			for _, record := range zone.Records {
+				addrMap := map[string]net.IP{}
+
+				for _, addrSetName := range record.AddrSets {
+					for _, addr := range addrSetMap[addrSetName] {
+						addrMap[addr.String()] = addr
+					}
+				}
+
+				for _, addr := range slices.Collect(maps.Values(addrMap)) {
+					var typ string
+
+					switch {
+					case addr.To4() != nil:
+						typ = "A"
+					case addr.To16() != nil:
+						typ = "AAAA"
+					default:
+						continue
+					}
+
+					op := core.Operation{
+						Record: core.Record{
+							Type:  typ,
+							Value: addr.String(),
+							TTL:   record.TTL,
+						},
+						Op:        "update",
+						Domain:    record.Domain,
+						Subdomain: record.Subdomain,
+					}
+					if op.Subdomain == "" {
+						op.CanonicalName = op.Domain
+					} else {
+						op.CanonicalName = op.Subdomain + "." + op.Domain
+					}
+					operations = append(operations, &op)
+				}
+			}
+
+			go func() {
+				u, err := url.JoinPath(zone.Server, "/v1/do")
 				if err != nil {
 					fmt.Println(err)
 					return
 				}
-				fmt.Println(string(b))
+
+				resp, err := http.Post(u, "application/json", bytes.NewReader(MarshalJSON(&ReqDo{
+					Role:       zone.Role,
+					Token:      zone.Key,
+					Operations: operations,
+				})))
+				if err != nil {
+					fmt.Println(err)
+				}
+				if resp.StatusCode != http.StatusOK {
+					b, err := io.ReadAll(resp.Body)
+					if err != nil {
+						fmt.Println(err)
+						return
+					}
+					fmt.Println(string(b))
+				}
+			}()
+
+			for _, op := range operations {
+				fmt.Println("Update", op.CanonicalName, "=>", op.Value)
 			}
-		}()
-
-		for _, op := range operations {
-			fmt.Println("Update", op.CanonicalName, "=>", op.Value)
 		}
-	}
 
-	return nil
+		return nil
+	}
 }
 
 func LoadDDNSConfig(path string) (*DDNSConfig, error) {
